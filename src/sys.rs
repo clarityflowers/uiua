@@ -4,10 +4,14 @@ use std::{
     mem::take,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{self, AtomicU64},
+        Arc, OnceLock,
+    },
     time::Duration,
 };
 
+use ecow::EcoVec;
 use enum_iterator::{all, Sequence};
 #[cfg(feature = "audio_encode")]
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
@@ -261,6 +265,8 @@ sys_op! {
     /// The stream handle `1` is stdout.
     /// The stream handle `2` is stderr.
     (2(0), Write, Stream, "&w", "write", [mutating]),
+    /// Convert an array to a stream
+    (1, Stream, Stream, "&stream", "stream"),
     /// Invoke a path with the system's default program
     (1(1), Invoke, Command, "&invk", "invoke", [mutating]),
     /// Close a stream by its handle
@@ -636,6 +642,22 @@ impl Value {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ArrayReadStream {
+    bytes: EcoVec<u8>,
+    pos: usize,
+}
+
+impl ArrayReadStream {
+    fn read_bytes(&mut self, count: Option<usize>) -> Vec<u8> {
+        let bytes_left = self.bytes.len().saturating_sub(self.pos);
+        let len = count.map_or(bytes_left, |c| c.min(bytes_left));
+        let bytes = self.bytes[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+        bytes
+    }
+}
+
 /// The function type passed to `&ast`
 pub type AudioStreamFn = Box<dyn FnMut(&[f64]) -> UiuaResult<Vec<[f64; 2]>> + Send>;
 
@@ -671,6 +693,8 @@ pub trait SysBackend: Any + Send + Sync + 'static {
     fn any(&self) -> &dyn Any;
     /// Cast the backend to `&mut dyn Any`
     fn any_mut(&mut self) -> &mut dyn Any;
+    /// Get a new stream handle
+    fn next_handle(&self) -> Handle;
     /// Save a color-formatted version of an error message for later printing
     fn save_error_color(&self, message: String, colored: String) {}
     /// Print a string (without a newline) to stdout
@@ -924,17 +948,32 @@ impl fmt::Debug for dyn SysBackend {
 }
 
 /// A safe backend with no IO other than captured stdout and stderr
-#[derive(Default)]
+
 pub struct SafeSys {
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    next_handle: AtomicU64,
 }
+
+impl Default for SafeSys {
+    fn default() -> Self {
+        Self {
+            stdout: Arc::new(Mutex::new(Vec::new())),
+            stderr: Arc::new(Mutex::new(Vec::new())),
+            next_handle: AtomicU64::new(Handle::FIRST_UNRESERVED.0),
+        }
+    }
+}
+
 impl SysBackend for SafeSys {
     fn any(&self) -> &dyn Any {
         self
     }
     fn any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn next_handle(&self) -> Handle {
+        Handle(self.next_handle.fetch_add(1, atomic::Ordering::Relaxed))
     }
     fn print_str_stdout(&self, s: &str) -> Result<(), String> {
         self.stdout.lock().extend_from_slice(s.as_bytes());
@@ -1086,24 +1125,28 @@ impl SysOp {
                     validate_size::<u8>(count, env)?;
                 }
                 let handle = env.pop(2)?.as_handle(env, "")?;
-                let bytes = match handle {
-                    Handle::STDOUT => return Err(env.error("Cannot read from stdout")),
-                    Handle::STDERR => return Err(env.error("Cannot read from stderr")),
-                    Handle::STDIN => {
-                        if let Some(count) = count {
-                            env.rt.backend.scan_stdin(count).map_err(|e| env.error(e))?
-                        } else {
-                            return Err(env.error("Cannot read an infinite amount from stdin"));
+                let bytes = if let Some(mut stream) = env.rt.array_read_streams.get_mut(&handle) {
+                    stream.read_bytes(count)
+                } else {
+                    match handle {
+                        Handle::STDOUT => return Err(env.error("Cannot read from stdout")),
+                        Handle::STDERR => return Err(env.error("Cannot read from stderr")),
+                        Handle::STDIN => {
+                            if let Some(count) = count {
+                                env.rt.backend.scan_stdin(count).map_err(|e| env.error(e))?
+                            } else {
+                                return Err(env.error("Cannot read an infinite amount from stdin"));
+                            }
                         }
-                    }
-                    _ => {
-                        if let Some(count) = count {
-                            env.rt
-                                .backend
-                                .read(handle, count)
-                                .map_err(|e| env.error(e))?
-                        } else {
-                            env.rt.backend.read_all(handle).map_err(|e| env.error(e))?
+                        _ => {
+                            if let Some(count) = count {
+                                env.rt
+                                    .backend
+                                    .read(handle, count)
+                                    .map_err(|e| env.error(e))?
+                            } else {
+                                env.rt.backend.read_all(handle).map_err(|e| env.error(e))?
+                            }
                         }
                     }
                 };
@@ -1118,24 +1161,28 @@ impl SysOp {
                     validate_size::<u8>(count, env)?;
                 }
                 let handle = env.pop(2)?.as_handle(env, "")?;
-                let bytes = match handle {
-                    Handle::STDOUT => return Err(env.error("Cannot read from stdout")),
-                    Handle::STDERR => return Err(env.error("Cannot read from stderr")),
-                    Handle::STDIN => {
-                        if let Some(count) = count {
-                            env.rt.backend.scan_stdin(count).map_err(|e| env.error(e))?
-                        } else {
-                            return Err(env.error("Cannot read an infinite amount from stdin"));
+                let bytes = if let Some(mut stream) = env.rt.array_read_streams.get_mut(&handle) {
+                    stream.read_bytes(count)
+                } else {
+                    match handle {
+                        Handle::STDOUT => return Err(env.error("Cannot read from stdout")),
+                        Handle::STDERR => return Err(env.error("Cannot read from stderr")),
+                        Handle::STDIN => {
+                            if let Some(count) = count {
+                                env.rt.backend.scan_stdin(count).map_err(|e| env.error(e))?
+                            } else {
+                                return Err(env.error("Cannot read an infinite amount from stdin"));
+                            }
                         }
-                    }
-                    _ => {
-                        if let Some(count) = count {
-                            env.rt
-                                .backend
-                                .read(handle, count)
-                                .map_err(|e| env.error(e))?
-                        } else {
-                            env.rt.backend.read_all(handle).map_err(|e| env.error(e))?
+                        _ => {
+                            if let Some(count) = count {
+                                env.rt
+                                    .backend
+                                    .read(handle, count)
+                                    .map_err(|e| env.error(e))?
+                            } else {
+                                env.rt.backend.read_all(handle).map_err(|e| env.error(e))?
+                            }
                         }
                     }
                 };
@@ -1147,63 +1194,106 @@ impl SysOp {
                 if delim.rank() > 1 {
                     return Err(env.error("Delimiter must be a rank 0 or 1 string or byte array"));
                 }
-                match handle {
-                    Handle::STDOUT => return Err(env.error("Cannot read from stdout")),
-                    Handle::STDERR => return Err(env.error("Cannot read from stderr")),
-                    Handle::STDIN => {
-                        let mut is_string = false;
-                        let delim_bytes: Vec<u8> = match delim {
-                            Value::Num(arr) => arr.data.iter().map(|&x| x as u8).collect(),
-                            Value::Byte(arr) => arr.data.into(),
+                let mut string_delim = false;
+                let delim_bytes: EcoVec<u8> = match delim {
+                    Value::Num(arr) => arr.data.iter().map(|&x| x as u8).collect(),
+                    Value::Byte(arr) => arr.data.into(),
+                    Value::Char(arr) => {
+                        let len: usize = arr.data.iter().map(|c| c.len_utf8()).sum();
+                        let mut bytes = EcoVec::with_capacity(len);
+                        for c in arr.data {
+                            bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                        }
+                        string_delim = true;
+                        bytes
+                    }
+                    _ => return Err(env.error("Delimiter must be a string or byte array")),
+                };
+                let stream = env.rt.array_read_streams.get_mut(&handle);
+                if let Some(mut stream) = stream {
+                    let end_bound = (stream.bytes.len())
+                        .saturating_sub(delim_bytes.len())
+                        .max(stream.pos);
+                    let start = stream.pos;
+                    let end = (start..end_bound)
+                        .find(|&i| stream.bytes[i..].starts_with(&delim_bytes))
+                        .unwrap_or(end_bound);
+                    stream.pos = end_bound + delim_bytes.len();
+                    if string_delim {
+                        let s = String::from_utf8(stream.bytes[start..end].to_vec())
+                            .map_err(|e| env.error(e))?;
+                        drop(stream);
+                        env.push(s);
+                    } else {
+                        let bytes = EcoVec::from(&stream.bytes[start..end]);
+                        drop(stream);
+                        env.push(bytes);
+                    }
+                    return Ok(());
+                } else {
+                    drop(stream);
+                    match handle {
+                        Handle::STDOUT => return Err(env.error("Cannot read from stdout")),
+                        Handle::STDERR => return Err(env.error("Cannot read from stderr")),
+                        Handle::STDIN => {
+                            let mut is_string = false;
+                            let delim_bytes: Vec<u8> = match delim {
+                                Value::Num(arr) => arr.data.iter().map(|&x| x as u8).collect(),
+                                Value::Byte(arr) => arr.data.into(),
+                                Value::Char(arr) => {
+                                    is_string = true;
+                                    arr.data.iter().collect::<String>().into()
+                                }
+                                _ => {
+                                    return Err(
+                                        env.error("Delimiter must be a string or byte array")
+                                    )
+                                }
+                            };
+                            let buffer = env
+                                .rt
+                                .backend
+                                .scan_until_stdin(&delim_bytes)
+                                .map_err(|e| env.error(e))?;
+                            if is_string {
+                                let s = String::from_utf8_lossy(&buffer).into_owned();
+                                env.push(s);
+                            } else {
+                                env.push(Array::from(buffer.as_slice()));
+                            }
+                        }
+                        _ => match delim {
+                            Value::Num(arr) => {
+                                let delim: Vec<u8> = arr.data.iter().map(|&x| x as u8).collect();
+                                let bytes = env
+                                    .rt
+                                    .backend
+                                    .read_until(handle, &delim)
+                                    .map_err(|e| env.error(e))?;
+                                env.push(Array::from(bytes.as_slice()));
+                            }
+                            Value::Byte(arr) => {
+                                let delim: Vec<u8> = arr.data.into();
+                                let bytes = env
+                                    .rt
+                                    .backend
+                                    .read_until(handle, &delim)
+                                    .map_err(|e| env.error(e))?;
+                                env.push(Array::from(bytes.as_slice()));
+                            }
                             Value::Char(arr) => {
-                                is_string = true;
-                                arr.data.iter().collect::<String>().into()
+                                let delim: Vec<u8> = arr.data.iter().collect::<String>().into();
+                                let bytes = env
+                                    .rt
+                                    .backend
+                                    .read_until(handle, &delim)
+                                    .map_err(|e| env.error(e))?;
+                                let s = String::from_utf8(bytes).map_err(|e| env.error(e))?;
+                                env.push(s);
                             }
                             _ => return Err(env.error("Delimiter must be a string or byte array")),
-                        };
-                        let buffer = env
-                            .rt
-                            .backend
-                            .scan_until_stdin(&delim_bytes)
-                            .map_err(|e| env.error(e))?;
-                        if is_string {
-                            let s = String::from_utf8_lossy(&buffer).into_owned();
-                            env.push(s);
-                        } else {
-                            env.push(Array::from(buffer.as_slice()));
-                        }
+                        },
                     }
-                    _ => match delim {
-                        Value::Num(arr) => {
-                            let delim: Vec<u8> = arr.data.iter().map(|&x| x as u8).collect();
-                            let bytes = env
-                                .rt
-                                .backend
-                                .read_until(handle, &delim)
-                                .map_err(|e| env.error(e))?;
-                            env.push(Array::from(bytes.as_slice()));
-                        }
-                        Value::Byte(arr) => {
-                            let delim: Vec<u8> = arr.data.into();
-                            let bytes = env
-                                .rt
-                                .backend
-                                .read_until(handle, &delim)
-                                .map_err(|e| env.error(e))?;
-                            env.push(Array::from(bytes.as_slice()));
-                        }
-                        Value::Char(arr) => {
-                            let delim: Vec<u8> = arr.data.iter().collect::<String>().into();
-                            let bytes = env
-                                .rt
-                                .backend
-                                .read_until(handle, &delim)
-                                .map_err(|e| env.error(e))?;
-                            let s = String::from_utf8(bytes).map_err(|e| env.error(e))?;
-                            env.push(s);
-                        }
-                        _ => return Err(env.error("Delimiter must be a string or byte array")),
-                    },
                 }
             }
             SysOp::Write => {
@@ -1234,6 +1324,25 @@ impl SysOp {
                         .write(handle, &bytes)
                         .map_err(|e| env.error(e))?,
                 }
+            }
+            SysOp::Stream => {
+                let val = env.pop(1)?;
+                let bytes: EcoVec<u8> = match val {
+                    Value::Num(arr) => arr.data.iter().map(|&x| x as u8).collect(),
+                    Value::Byte(arr) => arr.data.into(),
+                    Value::Char(arr) => {
+                        let len: usize = arr.data.iter().map(|c| c.len_utf8()).sum();
+                        let mut bytes = EcoVec::with_capacity(len);
+                        for c in arr.data {
+                            bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                        }
+                        bytes
+                    }
+                    _ => return Err(env.error("Stream value must be a byte array")),
+                };
+                let handle = env.rt.backend.next_handle();
+                let stream = ArrayReadStream { bytes, pos: 0 };
+                env.rt.array_read_streams.insert(handle, stream);
             }
             SysOp::FReadAllStr => {
                 let path = env.pop(1)?.as_string(env, "Path must be a string")?;

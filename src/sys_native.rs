@@ -206,6 +206,9 @@ impl SysBackend for NativeSys {
     fn any_mut(&mut self) -> &mut dyn Any {
         self
     }
+    fn next_handle(&self) -> Handle {
+        NATIVE_SYS.new_handle()
+    }
     fn print_str_stdout(&self, s: &str) -> Result<(), String> {
         if !NATIVE_SYS.output_enabled.load(atomic::Ordering::Relaxed) {
             return Ok(());

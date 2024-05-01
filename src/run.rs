@@ -14,6 +14,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use dashmap::DashMap;
 use enum_iterator::{all, Sequence};
 use instant::Duration;
 use thread_local::ThreadLocal;
@@ -26,8 +27,9 @@ use crate::{
     function::*,
     lex::Span,
     value::Value,
-    Assembly, BindingKind, Compiler, Complex, Ident, Inputs, IntoSysBackend, LocalName, Primitive,
-    SafeSys, SysBackend, SysOp, TraceFrame, UiuaError, UiuaResult, VERSION,
+    ArrayReadStream, Assembly, BindingKind, Compiler, Complex, Handle, Ident, Inputs,
+    IntoSysBackend, LocalName, Primitive, SafeSys, SysBackend, SysOp, TraceFrame, UiuaError,
+    UiuaResult, VERSION,
 };
 
 /// The Uiua interpreter
@@ -73,6 +75,8 @@ pub(crate) struct Runtime {
     cli_file_path: PathBuf,
     /// The system backend
     pub(crate) backend: Arc<dyn SysBackend>,
+    /// Streamed array data
+    pub(crate) array_read_streams: Arc<DashMap<Handle, ArrayReadStream>>,
     /// The thread interface
     thread: ThisThread,
     /// Values for output comments
@@ -198,6 +202,7 @@ impl Default for Runtime {
             fill_stack: Vec::new(),
             locals_stack: Vec::new(),
             backend: Arc::new(SafeSys::default()),
+            array_read_streams: Arc::new(DashMap::new()),
             time_instrs: false,
             last_time: 0.0,
             do_top_io: true,
@@ -1387,6 +1392,7 @@ code:
                 cli_arguments: self.rt.cli_arguments.clone(),
                 cli_file_path: self.rt.cli_file_path.clone(),
                 backend: self.rt.backend.clone(),
+                array_read_streams: self.rt.array_read_streams.clone(),
                 execution_limit: self.rt.execution_limit,
                 execution_start: self.rt.execution_start,
                 output_comments: HashMap::new(),

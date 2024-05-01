@@ -289,6 +289,16 @@ impl<T: Clone> From<EcoVec<T>> for CowSlice<T> {
     }
 }
 
+impl<T: Clone> From<CowSlice<T>> for EcoVec<T> {
+    fn from(mut slice: CowSlice<T>) -> Self {
+        if slice.data.is_unique() && slice.start == 0 && slice.end == slice.data.len() {
+            slice.data
+        } else {
+            EcoVec::from(&*slice)
+        }
+    }
+}
+
 impl<'a, T: Clone> From<&'a [T]> for CowSlice<T> {
     fn from(slice: &'a [T]) -> Self {
         Self {
