@@ -197,6 +197,12 @@ impl<T: Clone> CowSlice<T> {
             data.truncate(data.len() - (end - start));
         })
     }
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.modify(|data| data.retain(|item| f(item)))
+    }
     pub fn extend_from_array<const N: usize>(&mut self, array: [T; N]) {
         self.modify(|data| unsafe { data.extend_from_trusted(array) })
     }

@@ -4,7 +4,6 @@ mod combine;
 mod structure;
 
 use std::{
-    borrow::Cow,
     cmp::Ordering,
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -518,124 +517,108 @@ impl<T: ArrayValue> Array<T> {
     }
     /// `keep` this array with some counts
     pub fn list_keep(mut self, counts: &[usize], env: &Uiua) -> UiuaResult<Self> {
+        if counts.len() > self.row_count() {
+            return Err(env.error(format!(
+                "Cannot keep array with shape {} with array of length {}",
+                self.shape(),
+                counts.len()
+            )));
+        }
         self.take_map_keys();
-        let mut amount = Cow::Borrowed(counts);
-        match amount.len().cmp(&self.row_count()) {
-            Ordering::Equal => {}
-            Ordering::Less => match env.num_array_fill() {
-                Ok(fill) => {
-                    if let Some(n) = fill.data.iter().find(|&&n| n < 0.0 || n.fract() != 0.0) {
-                        return Err(env.error(format!(
-                            "Fill value for keep must be an array of \
-                            non-negative integers, but one of the \
-                            values is {n}"
-                        )));
-                    }
-                    match fill.rank() {
-                        0 => {
-                            let fill = fill.data[0] as usize;
-                            let mut new_amount = amount.to_vec();
-                            new_amount.extend(repeat(fill).take(self.row_count() - amount.len()));
-                            amount = new_amount.into();
-                        }
-                        1 => {
-                            let mut new_amount = amount.to_vec();
-                            new_amount.extend(
-                                (fill.data.iter().map(|&n| n as usize).cycle())
-                                    .take(self.row_count() - amount.len()),
-                            );
-                            amount = new_amount.into();
-                        }
-                        _ => {
-                            return Err(env.error(format!(
-                                "Fill value for keep must be a scalar or a 1D array, \
-                                but it has shape {}",
-                                fill.shape
-                            )));
-                        }
-                    }
-                }
-                Err(e) => {
+        let fill = env
+            .num_array_fill()
+            .map_err(|e| {
+                env.error(format!(
+                    "Cannot keep array with shape {} with array of shape {}{e}",
+                    self.shape(),
+                    FormatShape(&[counts.len()])
+                ))
+            })
+            .and_then(|fill| {
+                if let Some(n) = fill.data.iter().find(|&&n| n < 0.0 || n.fract() != 0.0) {
                     return Err(env.error(format!(
-                        "Cannot keep array with shape {} with array of shape {}{e}",
-                        self.shape(),
-                        FormatShape(&[amount.len()])
+                        "Fill value for keep must be an array of \
+                        non-negative integers, but one of the \
+                        values is {n}"
                     )));
                 }
-            },
-            Ordering::Greater => {
-                return Err(env.error(match env.num_array_fill() {
-                    Ok(_) => {
-                        format!(
-                            "Cannot keep array with shape {} with array of shape {}. \
-                            A fill value is available, but keep can only been filled \
-                            if there are fewer counts than rows.",
-                            self.shape(),
-                            FormatShape(&[amount.len()])
-                        )
-                    }
-                    Err(e) => {
-                        format!(
-                            "Cannot keep array with shape {} with array of shape {}{e}",
-                            self.shape(),
-                            FormatShape(&[amount.len()])
-                        )
-                    }
-                }))
-            }
-        }
-        if self.rank() == 0 {
-            if amount.len() != 1 {
-                return Err(env.error("Scalar array can only be kept with a single number"));
-            }
-            let mut new_data = EcoVec::with_capacity(amount[0]);
-            for _ in 0..amount[0] {
-                new_data.push(self.data[0].clone());
-            }
-            self = new_data.into();
+                Ok(fill)
+            });
+        let fill = if counts.len() < self.row_count() {
+            Some(fill?)
         } else {
-            let mut all_bools = true;
-            let mut true_count = 0;
-            for &n in amount.iter() {
-                match n {
-                    0 => {}
-                    1 => true_count += 1,
-                    _ => {
-                        all_bools = false;
-                        break;
+            None
+        };
+        let mut all_boolean = true;
+        let sum: usize = counts
+            .iter()
+            .copied()
+            .chain(
+                (fill.as_ref().into_iter())
+                    .flat_map(|arr| arr.data.iter().map(|&n| n as usize))
+                    .cycle(),
+            )
+            .take(self.row_count())
+            .inspect(|&n| all_boolean &= n <= 1)
+            .sum();
+        let get_count = |i: usize| {
+            counts.get(i).copied().unwrap_or_else(|| {
+                let fill = fill.as_ref().unwrap();
+                fill.data[(i - counts.len()) % fill.row_count()] as usize
+            })
+        };
+        let row_len = self.row_len();
+        let row_count = self.row_count();
+        if all_boolean {
+            let mut elem_idx = 0;
+            self.data.retain(|_| {
+                let keep = get_count(elem_idx / row_len) == 1;
+                elem_idx += 1;
+                keep
+            });
+        } else {
+            'efficient: {
+                let data = self.data.as_mut_slice();
+                let mut src = 0;
+                let mut dest = 0;
+                for r in 0..row_count {
+                    let count = get_count(r);
+                    // println!("r: {r}, count: {count}, src: {src}, dest: {dest}");
+                    if count == 0 {
+                        src += 1
+                    } else {
+                        if dest + count > src + 1 {
+                            let old_data = self.data.clone();
+                            self.data.truncate(dest * row_len);
+                            for r in r..row_count {
+                                let count = get_count(r);
+                                let start = src * row_len;
+                                for _ in 0..count {
+                                    self.data
+                                        .extend_from_slice(&old_data[start..start + row_len]);
+                                }
+                                src += 1;
+                            }
+                            break 'efficient;
+                        }
+                        let count_start = if src == dest { 1 } else { 0 };
+                        for c in count_start..count {
+                            // println!("  c: {c}");
+                            for j in 0..row_len {
+                                let dest = (dest + c) * row_len + j;
+                                let src = src * row_len + j;
+                                // println!("    j: {j}, {src} -> {dest}");
+                                data[dest] = data[src].clone();
+                            }
+                        }
+                        src += 1;
+                        dest += count;
                     }
                 }
             }
-            let row_len = self.row_len();
-            if all_bools {
-                let new_flat_len = true_count * row_len;
-                let mut new_data = CowSlice::with_capacity(new_flat_len);
-                if row_len > 0 {
-                    for (b, r) in amount.iter().zip(self.data.chunks_exact(row_len)) {
-                        if *b == 1 {
-                            new_data.extend_from_slice(r);
-                        }
-                    }
-                }
-                self.data = new_data;
-                self.shape[0] = true_count;
-            } else {
-                let mut new_data = CowSlice::new();
-                let mut new_len = 0;
-                if row_len > 0 {
-                    for (n, r) in amount.iter().zip(self.data.chunks_exact(row_len)) {
-                        new_len += *n;
-                        for _ in 0..*n {
-                            new_data.extend_from_slice(r);
-                        }
-                    }
-                } else {
-                    new_len = amount.iter().sum();
-                }
-                self.data = new_data;
-                self.shape[0] = new_len;
-            }
+            self.data.truncate(sum * row_len);
         }
+        self.shape[0] = sum;
         self.validate_shape();
         Ok(self)
     }

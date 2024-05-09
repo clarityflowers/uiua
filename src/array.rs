@@ -353,7 +353,7 @@ impl<T: ArrayValue> Array<T> {
         }
     }
     /// Get an iterator over the row arrays of the array
-    pub fn rows(&self) -> impl ExactSizeIterator<Item = Self> + DoubleEndedIterator + '_ {
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = Self> + DoubleEndedIterator + Clone + '_ {
         (0..self.row_count()).map(|row| self.row(row))
     }
     pub(crate) fn row_shaped_slice(&self, index: usize, row_shape: Shape) -> Self {
