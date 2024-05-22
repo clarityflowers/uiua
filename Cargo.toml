@@ -140,3 +140,6 @@ members = ["site", "tests_ffi"]
 
 [profile.dev]
 incremental = true
+
+[profile.release]
+opt-level = 's'
