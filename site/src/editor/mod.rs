@@ -1166,7 +1166,7 @@ pub fn Editor<'a>(
                 set_initial_code.set(None);
                 state.update(|state| state.set_code(&code, Cursor::Ignore));
             } else {
-                run(false, false)
+                run(false, false);
             }
         },
         Duration::from_millis(0),
@@ -1511,6 +1511,11 @@ pub fn Editor<'a>(
                             </div>
                             <div
                                 class="code-and-overlay">
+                                <div
+                                    id=overlay_id
+                                    class="code-overlay">
+                                    { move || gen_code_view(&overlay.get()) }
+                                </div>
                                 /////////////////////////
                                 // The text entry area //
                                 /////////////////////////
@@ -1527,11 +1532,6 @@ pub fn Editor<'a>(
                                     value=initial_code_str>
                                 </textarea>
                                 /////////////////////////
-                                <div
-                                    id=overlay_id
-                                    class="code-overlay">
-                                    { move || gen_code_view(&overlay.get()) }
-                                </div>
                             </div>
                         </div>
                         <div id="code-right-side">
