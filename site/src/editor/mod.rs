@@ -16,14 +16,14 @@ use uiua::{
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 use web_sys::{
     DragEvent, Event, FileReader, HtmlDivElement, HtmlInputElement, HtmlSelectElement,
-    HtmlTextAreaElement, MouseEvent, ResizeObserver, ResizeObserverEntry,
+    HtmlTextAreaElement, MouseEvent,
 };
 
 use crate::{
     backend::{drop_file, OutputItem},
     element,
     examples::EXAMPLES,
-    get_element, prim_class, Prim,
+    prim_class, Prim,
 };
 
 use utils::*;
@@ -83,11 +83,11 @@ pub fn Editor<'a>(
 
     let code_id = move || format!("code{id}");
     let code_outer_id = move || format!("code-outer{id}");
-    let overlay_id = move || format!("overlay{id}");
     let glyph_doc_id = move || format!("glyphdoc{id}");
     let hover_id = move || format!("hover{id}");
 
-    let code_element = move || -> HtmlTextAreaElement { element(&code_id()) };
+    let code_element = move || -> HtmlDivElement { element(&code_id()) };
+    #[allow(unused)]
     let code_outer_element = move || -> HtmlDivElement { element(&code_outer_id()) };
     let glyph_doc_element = move || -> HtmlDivElement { element(&glyph_doc_id()) };
 
@@ -118,13 +118,13 @@ pub fn Editor<'a>(
         )
     };
     let get_code = move || get_code(&code_id());
-    let (overlay, set_overlay) = create_signal(String::new());
+    let (get_code_string, set_code_string) = create_signal("Loading...".to_string());
 
     // Initialize the state
     let state = State {
         code_id: code_id(),
         code_outer_id: code_outer_id(),
-        set_overlay,
+        set_code_string,
         set_line_count,
         set_copied_link,
         past: Vec::new(),
@@ -141,8 +141,6 @@ pub fn Editor<'a>(
                 after: (len, len),
             }
         },
-        resize_observer: None,
-        resize_observer_closure: Closure::new(move |_: Vec<ResizeObserverEntry>| {}).into(),
     };
     let (get_state, state) = create_signal(state);
 
@@ -407,17 +405,6 @@ pub fn Editor<'a>(
     window_event_listener(keyup, move |event| {
         let event = event.dyn_ref::<web_sys::KeyboardEvent>().unwrap();
         update_ctrl(event);
-        let key = event.key();
-        // logging::log!("release: {key:?}");
-
-        if key == "Control" && !on_mac() || key == "Meta" && on_mac() {
-            if let Some(overlay_element) = get_element::<HtmlDivElement>(&overlay_id()) {
-                overlay_element
-                    .style()
-                    .set_property("pointer-events", "none")
-                    .unwrap();
-            }
-        }
     });
     window_event_listener(keydown, move |event| {
         let event = event.dyn_ref::<web_sys::KeyboardEvent>().unwrap();
@@ -425,15 +412,6 @@ pub fn Editor<'a>(
         let key = event.key();
         let key = key.as_str();
         // logging::log!("press: {key:?}");
-
-        if key == "Control" && !on_mac() || key == "Meta" && on_mac() {
-            if let Some(overlay_element) = get_element::<HtmlDivElement>(&overlay_id()) {
-                overlay_element
-                    .style()
-                    .set_property("pointer-events", "all")
-                    .unwrap();
-            }
-        }
 
         let focused = event
             .target()
@@ -764,9 +742,9 @@ pub fn Editor<'a>(
                 );
             }
             // Normal key input
-            key if key.chars().count() == 1 && !os_ctrl(event) && !event.alt_key() => {
-                state.update(|state| replace_code(state, key));
-            }
+            // key if key.chars().count() == 1 && !os_ctrl(event) && !event.alt_key() => {
+            //     state.update(|state| replace_code(state, key));
+            // }
             _ => handled = false,
         }
         if handled {
@@ -807,47 +785,6 @@ pub fn Editor<'a>(
             },
             Duration::from_millis(0),
         );
-    };
-
-    // Handle mouse events
-    let code_mouse_move = move |event: MouseEvent| {
-        let (mouse_x, mouse_y) = (event.client_x(), event.client_y());
-        let overlay: HtmlDivElement = element(&overlay_id());
-        let children = overlay.children();
-        let mut subchildren = (0..children.length())
-            .map(|i| children.item(i).unwrap())
-            .flat_map(|child| {
-                let children = child.children();
-                (0..children.length()).map(move |i| children.item(i).unwrap())
-            });
-        let hover_elem: HtmlDivElement = element(&hover_id());
-        let Some((data_title, rect)) = subchildren
-            .find(|child| {
-                let rect = child.get_bounding_client_rect();
-                rect.left() <= mouse_x as f64
-                    && mouse_x as f64 <= rect.right()
-                    && rect.top() <= mouse_y as f64
-                    && mouse_y as f64 <= rect.bottom()
-            })
-            .and_then(|child| {
-                child
-                    .get_attribute("data-title")
-                    .map(|title| (title, child.get_bounding_client_rect()))
-            })
-        else {
-            hover_elem.style().set_property("display", "none").unwrap();
-            return;
-        };
-        // Set hover elem pos to mouse pos
-        let style = hover_elem.style();
-        let left = rect.left();
-        let top = rect.bottom();
-        _ = style.set_property("left", &format!("{left}px"));
-        _ = style.set_property("top", &format!("{top}px"));
-        // Set hover elem text to hovered data-title
-        hover_elem.set_inner_text(&data_title);
-        // Show hover elem
-        hover_elem.style().set_property("display", "block").unwrap();
     };
 
     // Handle mouse leave events
@@ -1172,30 +1109,6 @@ pub fn Editor<'a>(
         Duration::from_millis(0),
     );
 
-    // Update minimum textarea height when code div is resized
-    set_timeout(
-        move || {
-            state.update(|st| {
-                st.resize_observer_closure =
-                    Closure::new(move |entries: Vec<ResizeObserverEntry>| {
-                        for entry in entries {
-                            let height = entry.content_rect().height();
-                            state.update(|state| {
-                                state.min_height = format!("{height}px");
-                                state.update_size();
-                            });
-                        }
-                    })
-                    .into();
-                let function = (*st.resize_observer_closure).as_ref().unchecked_ref();
-                let observer = ResizeObserver::new(function).unwrap();
-                observer.observe(&code_outer_element());
-                st.resize_observer = Some(observer.into());
-            });
-        },
-        Duration::from_millis(0),
-    );
-
     let (drag_message, set_drag_message) = create_signal("");
 
     // Get file drop events
@@ -1505,34 +1418,27 @@ pub fn Editor<'a>(
                         <div
                             id=code_outer_id
                             class="code code-outer sized-code"
-                            style={format!("height: {}em;", code_height_em + 1.25 / 2.0)}>
+                            style={format!("height: {}em;", code_height_em)}>
                             <div class="line-numbers">
                                 { line_numbers }
                             </div>
+                            /////////////////////////
+                            // The text entry area //
+                            /////////////////////////
                             <div
-                                class="code-and-overlay">
-                                <div
-                                    id=overlay_id
-                                    class="code-overlay">
-                                    { move || gen_code_view(&overlay.get()) }
-                                </div>
-                                /////////////////////////
-                                // The text entry area //
-                                /////////////////////////
-                                <textarea
-                                    id=code_id
-                                    class="code-entry"
-                                    autocorrect="false"
-                                    autocapitalize="off"
-                                    spellcheck="false"
-                                    on:paste=code_paste
-                                    on:input=code_input
-                                    on:mousemove=code_mouse_move
-                                    on:mouseleave=code_mouse_leave
-                                    value=initial_code_str>
-                                </textarea>
-                                /////////////////////////
+                                id=code_id
+                                class="code-entry"
+                                contenteditable="true"
+                                autocorrect="false"
+                                autocapitalize="off"
+                                spellcheck="false"
+                                on:paste=code_paste
+                                on:input=code_input
+                                on:mouseleave=code_mouse_leave
+                                value=initial_code_str>
+                                {move || gen_code_view(&get_code_string.get())}
                             </div>
+                            /////////////////////////
                         </div>
                         <div id="code-right-side">
                             <button

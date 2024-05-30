@@ -1,8 +1,7 @@
 use std::{
-    borrow::Cow,
     cell::Cell,
+    iter,
     mem::{replace, take},
-    rc::Rc,
     str::FromStr,
     time::Duration,
 };
@@ -19,17 +18,17 @@ use uiua::{
     Report, ReportFragment, ReportKind, SpanKind, SysBackend, Uiua, UiuaError, UiuaResult, Value,
 };
 use unicode_segmentation::UnicodeSegmentation;
-use wasm_bindgen::{closure::Closure, JsCast};
+use wasm_bindgen::JsCast;
 use web_sys::{
-    DomRect, Event, HtmlDivElement, HtmlSpanElement, HtmlStyleElement, HtmlTextAreaElement,
-    KeyboardEvent, MouseEvent, ResizeObserver, ResizeObserverEntry,
+    Comment, Event, HtmlBrElement, HtmlDivElement, HtmlStyleElement, KeyboardEvent, MouseEvent,
+    Node,
 };
 
 use crate::{
     backend::{OutputItem, WebBackend},
     binding_class,
     editor::Editor,
-    element, get_element, prim_class, sig_class,
+    element, prim_class, sig_class,
 };
 
 /// Handles setting the code in the editor, setting the cursor, and managing the history
@@ -37,7 +36,7 @@ use crate::{
 pub struct State {
     pub code_id: String,
     pub code_outer_id: String,
-    pub set_overlay: WriteSignal<String>,
+    pub set_code_string: WriteSignal<String>,
     pub set_line_count: WriteSignal<usize>,
     pub set_copied_link: WriteSignal<bool>,
     pub past: Vec<Record>,
@@ -46,8 +45,6 @@ pub struct State {
     pub challenge: Option<ChallengeDef>,
     pub loading_module: bool,
     pub min_height: String,
-    pub resize_observer: Option<Rc<ResizeObserver>>,
-    pub resize_observer_closure: Rc<Closure<dyn Fn(Vec<ResizeObserverEntry>)>>,
 }
 
 /// A record of a code change
@@ -130,69 +127,22 @@ impl State {
     }
     fn set_code_element(&self, code: &str) {
         // logging::log!("set code: {code:?}");
+        self.set_code_string.set(code.into());
         if let Some(cursor) = get_code_cursor(&self.code_id) {
             self.set_cursor(cursor);
         }
-        self.set_overlay.set(code.into());
-        let area = element::<HtmlTextAreaElement>(&self.code_id);
-        area.set_value(code);
-        self.update_size();
     }
     pub fn refresh_code(&self) {
         let code = get_code(&self.code_id);
         self.set_code_element(&code);
     }
-    pub fn update_size(&self) {
-        let Some(area) = get_element::<HtmlTextAreaElement>(&self.code_id) else {
-            return;
-        };
-        let code = get_code(&self.code_id);
-        let rect = &virtual_rect(&area, &code);
-        let width = rect.width();
-        let height = rect.height().min(area.scroll_height() as f64);
-        let new_height = format!("max({height}px,{})", self.min_height);
-        let new_width = format!("max(calc({width}px + 1em),100%)");
-        area.style().set_property("width", "auto").unwrap();
-        area.style().set_property("height", "auto").unwrap();
-        area.style().set_property("width", &new_width).unwrap();
-        area.style().set_property("height", &new_height).unwrap();
-    }
     pub fn set_cursor(&self, to: (u32, u32)) {
+        // let code_id = self.code_id.clone();
+        // set_timeout(
+        //     move || set_code_cursor(&code_id, to.0, to.1),
+        //     Duration::from_millis(0),
+        // );
         set_code_cursor(&self.code_id, to.0, to.1);
-
-        let area = element::<HtmlTextAreaElement>(&self.code_id);
-        let outer = element::<HtmlDivElement>(&self.code_outer_id);
-
-        let Some(cursor_position) = area.selection_end().unwrap() else {
-            return;
-        };
-        let code = get_code(&self.code_id);
-        let vert_text = code
-            .chars()
-            .take(cursor_position as usize)
-            .collect::<String>();
-        let relative_y = virtual_rect(&area, &vert_text).height();
-        let (line, col) = line_col(&code, cursor_position as usize);
-        let horiz_text = code
-            .lines()
-            .nth(line - 1)
-            .unwrap_or("")
-            .chars()
-            .take(col - 1)
-            .collect::<String>();
-        let relative_x = virtual_rect(&area, &horiz_text).width();
-        let area_rect = virtual_rect(&area, &code);
-        let outer_rect = outer.get_bounding_client_rect();
-        let x = area_rect.left() + relative_x;
-        let y = area_rect.top() + relative_y;
-        if x > outer_rect.right() {
-            outer.set_scroll_left(outer.scroll_width());
-        } else if x < outer_rect.left() {
-            outer.set_scroll_left(0);
-        }
-        if y > outer_rect.bottom() {
-            outer.set_scroll_top(outer.scroll_height());
-        }
     }
     fn set_changed(&self) {
         self.set_copied_link.set(false);
@@ -225,39 +175,25 @@ impl State {
     }
 }
 
-impl Drop for State {
-    fn drop(&mut self) {
-        if let Some(Ok(ro)) = self.resize_observer.take().map(Rc::try_unwrap) {
-            ro.disconnect();
+pub fn get_code(id: &str) -> String {
+    let mut s = String::new();
+    let root = element::<HtmlDivElement>(id);
+    for (i, div) in children_of(&root).enumerate() {
+        if i > 0 {
+            s.push('\n');
+        }
+        let children: Vec<Node> = children_of(&div).collect();
+        if children.len() == 1 && children[0].dyn_ref::<HtmlBrElement>().is_some() {
+            s.push('\n');
+        } else {
+            for span in children {
+                let text = span.text_content().unwrap();
+                s.push_str(&text);
+            }
         }
     }
-}
-
-fn virtual_rect(area: &HtmlTextAreaElement, text: &str) -> DomRect {
-    let temp_span =
-        (document().create_element("span").unwrap()).unchecked_into::<HtmlSpanElement>();
-    (temp_span.style())
-        .set_property("visibility", "hidden")
-        .unwrap();
-    (temp_span.style())
-        .set_property("white-space", "pre")
-        .unwrap();
-    let area_style = &window().get_computed_style(area).unwrap().unwrap();
-    let area_font = area_style.get_property_value("font").unwrap();
-    temp_span.style().set_property("font", &area_font).unwrap();
-    let mut text = Cow::Borrowed(text);
-    if text.ends_with('\n') {
-        text.to_mut().push(' ');
-    }
-    temp_span.set_inner_text(&text);
-    document().body().unwrap().append_child(&temp_span).unwrap();
-    let rect = temp_span.get_bounding_client_rect();
-    document().body().unwrap().remove_child(&temp_span).unwrap();
-    rect
-}
-
-pub fn get_code(id: &str) -> String {
-    element::<HtmlTextAreaElement>(id).value()
+    logging::log!("get_code -> {:?}", s);
+    s
 }
 
 pub fn line_col(s: &str, pos: usize) -> (usize, usize) {
@@ -277,17 +213,227 @@ pub fn line_col(s: &str, pos: usize) -> (usize, usize) {
     (line, col)
 }
 
+fn children_of(node: &Node) -> impl Iterator<Item = Node> {
+    let mut curr = node.first_child();
+    iter::from_fn(move || {
+        let node = curr.take()?;
+        curr = node.next_sibling();
+        Some(node)
+    })
+    .filter(|node| node.dyn_ref::<Comment>().is_none())
+}
+
 pub fn get_code_cursor(id: &str) -> Option<(u32, u32)> {
-    let area = element::<HtmlTextAreaElement>(id);
-    let start = area.selection_start().unwrap()?;
-    let end = area.selection_end().unwrap()?;
+    let parent = element::<HtmlDivElement>(id);
+    let sel = window().get_selection().ok()??;
+    let (anchor_node, anchor_offset) = (sel.anchor_node()?, sel.anchor_offset());
+    let (focus_node, focus_offset) = (sel.focus_node()?, sel.focus_offset());
+    // logging::log!("anchor: {:?}, focus: {:?}", anchor_node, focus_node);
+    // logging::log!(
+    //     "anchor_offset: {:?}, focus_offset: {:?}",
+    //     anchor_offset,
+    //     focus_offset
+    // );
+    if !parent.contains(Some(&anchor_node)) || !parent.contains(Some(&focus_node)) {
+        return None;
+    }
+    let anchor_is_parent = parent.is_same_node(Some(&anchor_node));
+    let focus_is_parent = parent.is_same_node(Some(&focus_node));
+    // logging::log!("anchor_is_parent: {anchor_is_parent}, focus_is_parent: {focus_is_parent}");
+    let mut start = 0;
+    let mut end = 0;
+    let mut curr = 0;
+    if anchor_is_parent || focus_is_parent {
+        // This is the case when you double click in a spot off the end of a line
+        const PARENT_OFFSET: u32 = if cfg!(debug_assertions) { 2 } else { 0 };
+        for (i, div_node) in children_of(&parent).enumerate() {
+            let i = i as u32;
+            if i > 0 {
+                curr += 1;
+            }
+            if i + PARENT_OFFSET == anchor_offset && i + PARENT_OFFSET + 1 == focus_offset {
+                start = curr;
+            }
+            let is_br = children_of(&div_node).count() == 1
+                && children_of(&div_node)
+                    .next()
+                    .unwrap()
+                    .dyn_into::<HtmlBrElement>()
+                    .is_ok();
+            if is_br {
+            } else {
+                for span_node in children_of(&div_node) {
+                    let text_content = span_node.text_content().unwrap();
+                    curr += text_content.chars().count() as u32;
+                }
+            }
+
+            if i + PARENT_OFFSET == anchor_offset && i + PARENT_OFFSET + 1 == focus_offset {
+                end = curr;
+            }
+        }
+    } else {
+        start = anchor_offset;
+        end = focus_offset;
+        let child_count = children_of(&parent).count();
+        for (i, div_node) in children_of(&parent).enumerate() {
+            if i > 0 {
+                curr += 1;
+            }
+            if children_of(&div_node).count() == 1
+                && children_of(&div_node)
+                    .next()
+                    .unwrap()
+                    .dyn_into::<HtmlBrElement>()
+                    .is_ok()
+            {
+                // This is the case when you click on an empty line
+                // logging::log!("br");
+                if div_node.contains(Some(&anchor_node)) {
+                    start = curr + anchor_offset;
+                    if cfg!(debug_assertions)
+                        && div_node.is_same_node(Some(&anchor_node))
+                        && i + 1 < child_count
+                    {
+                        start = start.saturating_sub(1);
+                    }
+                    // logging::log!("start -> {:?}", start);
+                }
+                if div_node.contains(Some(&focus_node)) {
+                    end = curr + focus_offset;
+                    if cfg!(debug_assertions)
+                        && div_node.is_same_node(Some(&focus_node))
+                        && i + 1 < child_count
+                    {
+                        end = end.saturating_sub(1);
+                    }
+                    // logging::log!("end -> {:?}", end);
+                }
+            } else {
+                // This is the normal case
+                // logging::log!("normal");
+                let mut found = false;
+                let beginning_curr = curr;
+                for span_node in children_of(&div_node) {
+                    let text_content = span_node.text_content().unwrap();
+                    // logging::log!("text_content: {:?}", text_content);
+                    let len = text_content.chars().count() as u32;
+                    if span_node.contains(Some(&anchor_node)) {
+                        let anchor_char_offset =
+                            utf16_offset_to_char_offset(&text_content, anchor_offset);
+                        start = curr + anchor_char_offset;
+                        found = true;
+                        // logging::log!(
+                        //     "start change: curr: {}, offset: {}",
+                        //     curr,
+                        //     anchor_char_offset
+                        // );
+                        // logging::log!("start -> {:?}", start);
+                    }
+                    if span_node.contains(Some(&focus_node)) {
+                        let focus_char_offset =
+                            utf16_offset_to_char_offset(&text_content, focus_offset);
+                        end = curr + focus_char_offset;
+                        found = true;
+                        // logging::log!("end change: curr: {}, offset: {}", curr, focus_char_offset);
+                        // logging::log!("end -> {:?}", end);
+                    }
+                    // Increment curr by the length of the text in the node
+                    // logging::log!("curr {} -> {}", curr, curr + len);
+                    curr += len;
+                }
+                if !found {
+                    if div_node.is_same_node(Some(&anchor_node)) {
+                        start = beginning_curr + anchor_offset;
+                        // logging::log!("start -> {:?}", start);
+                    }
+                    if div_node.is_same_node(Some(&focus_node)) {
+                        end = beginning_curr + focus_offset;
+                        // logging::log!("end -> {:?}", end);
+                    }
+                }
+            }
+        }
+    }
+    logging::log!("get_code_cursor -> {:?}, {:?}", start, end);
     Some((start, end))
 }
 
+fn utf16_offset_to_char_offset(s: &str, utf16_offset: u32) -> u32 {
+    let mut char_offset = 0;
+    let mut utf16_index = 0;
+    for c in s.chars() {
+        if utf16_index == utf16_offset {
+            break;
+        }
+        utf16_index += c.len_utf16() as u32;
+        char_offset += 1;
+    }
+    char_offset
+}
+
+fn char_offset_to_utf16_offset(s: &str, char_offset: u32) -> u32 {
+    let mut utf16_offset = 0;
+    for c in s.chars().take(char_offset as usize) {
+        utf16_offset += c.len_utf16() as u32;
+    }
+    utf16_offset
+}
+
 fn set_code_cursor(id: &str, start: u32, end: u32) {
-    let area = element::<HtmlTextAreaElement>(id);
-    area.set_selection_range(start, end).unwrap();
-    // area.focus().unwrap();
+    logging::log!("set_code_cursor({}, {})", start, end);
+
+    let elem = element::<HtmlDivElement>(id);
+    let find_pos = |mut pos: u32| {
+        let mut text_len;
+        let mut last_node = None;
+        'divs: for (i, div_node) in children_of(&elem).enumerate() {
+            if i > 0 {
+                if pos > 0 {
+                    pos -= 1;
+                    last_node = Some(children_of(&div_node).next().unwrap());
+                } else {
+                    break 'divs;
+                }
+            }
+            for span_node in children_of(&div_node) {
+                if let Some(node) = children_of(&span_node).next() {
+                    text_len = node.text_content().unwrap().chars().count() as u32;
+                    last_node = Some(node);
+                } else {
+                    text_len = 0;
+                    last_node = Some(span_node);
+                }
+                if pos > text_len {
+                    pos -= text_len;
+                } else {
+                    break 'divs;
+                }
+            }
+        }
+        (last_node, pos)
+    };
+    let (start_node, mut start_len) = find_pos(start);
+    let (end_node, mut end_len) = find_pos(end);
+    if let Some((start_node, end_node)) = start_node.zip(end_node) {
+        let start_text = &start_node.text_content().unwrap();
+        let end_text = &end_node.text_content().unwrap();
+        // logging::log!("start: {start_len} of {start_text:?}");
+        start_len = char_offset_to_utf16_offset(
+            start_text,
+            start_len.min(start_text.chars().count() as u32),
+        );
+        end_len =
+            char_offset_to_utf16_offset(end_text, end_len.min(end_text.chars().count() as u32));
+        let range = document().create_range().unwrap();
+        range.set_start(&start_node, start_len).unwrap();
+        range.set_end(&end_node, end_len).unwrap();
+        let sel = window().get_selection().unwrap().unwrap();
+        sel.remove_all_ranges().unwrap();
+        sel.add_range(&range).unwrap();
+        elem.focus().unwrap();
+        get_code_cursor(id);
+    }
 }
 
 #[derive(Debug)]
